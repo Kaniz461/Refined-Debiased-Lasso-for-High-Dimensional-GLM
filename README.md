@@ -277,3 +277,197 @@ for p in [40, 100]:
 print("\n" + "="*70)
 print("✓ COMPLETE!")
 print("="*70)
+
+
+
+
+
+
+
+
+
+"""
+WORKING VERSION - Uses penalized MLE for stability
+Matches paper methodology for "large n, diverging p" scenario
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegressionCV, LassoCV, LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import norm
+import warnings
+warnings.filterwarnings("ignore")
+
+# Auto-detect file
+for f in os.listdir("/content"):
+    if f.endswith(".tsv") or f.endswith(".csv"):
+        DATA_PATH = os.path.join("/content", f)
+        break
+
+# Parameters
+n_genes = 11
+np.random.seed(42)
+
+# Load data
+df = pd.read_csv(DATA_PATH, sep="\t", index_col=0)
+expr = df.T if df.shape[0] > df.shape[1] else df.copy()
+
+# Select top variance genes
+top_genes = expr.var(axis=0).nlargest(n_genes).index.tolist()
+X_df = expr[top_genes]
+
+# Create binary outcome
+y = (expr[top_genes[0]].values > np.median(expr[top_genes[0]])).astype(int)
+n = len(y)
+
+# Standardize
+X = StandardScaler().fit_transform(X_df)
+X_int = np.column_stack([np.ones((n, 1)), X])
+p = X_int.shape[1]
+
+print(f"Sample size: n={n}, Dimension: p={p}, Ratio: p/n={p/n:.3f}")
+
+# Functions
+def logistic_mu(X, beta):
+    return 1 / (1 + np.exp(-np.clip(X @ beta, -30, 30)))
+
+def ref_ds(X_int, y, beta_lasso):
+    """REF-DS: Refined debiased lasso"""
+    n = len(y)
+    mu = logistic_mu(X_int, beta_lasso)
+    grad = -(X_int.T @ (y - mu)) / n
+    W = mu * (1 - mu)
+    H = (X_int.T * W) @ X_int / n + 1e-6 * np.eye(len(beta_lasso))
+    Theta = np.linalg.inv(H)
+    beta = beta_lasso - Theta @ grad
+    se = np.sqrt(np.diag(Theta)) / np.sqrt(n)
+    return beta, se
+
+def orig_ds(X_int, y, beta_lasso):
+    """ORIG-DS: Original debiased lasso"""
+    n, p = X_int.shape
+    mu = logistic_mu(X_int, beta_lasso)
+    grad = -(X_int.T @ (y - mu)) / n
+    W = mu * (1 - mu)
+    H = (X_int.T * W) @ X_int / n
+    C = (np.sqrt(W)[:, None] * X_int) / np.sqrt(n)
+    Theta = np.eye(p)
+    tau = np.zeros(p)
+    for j in range(p):
+        mask = [i for i in range(p) if i != j]
+        model = LassoCV(cv=5, fit_intercept=False, max_iter=2000).fit(
+            np.delete(C, j, axis=1), C[:, j])
+        gamma = model.coef_
+        Theta[j, mask] = -gamma
+        tau[j] = H[j, j] - H[j, mask] @ gamma
+    Theta = np.diag(1 / np.clip(tau, 1e-8, None)) @ Theta
+    beta = beta_lasso - Theta @ grad
+    se = np.sqrt(np.diag(Theta @ H @ Theta.T)) / np.sqrt(n)
+    return beta, se
+
+def mle_penalized(X, y):
+    """
+    Penalized MLE using ridge regularization
+    This is appropriate for 'large n, diverging p' scenario
+    Uses very weak penalty (C=1e8) to approximate MLE while ensuring stability
+    """
+    # Use L2 regularization with very weak penalty
+    model = LogisticRegression(
+        penalty='l2',
+        C=1e8,  # Very large C = very weak penalty ≈ MLE
+        solver='lbfgs',
+        max_iter=1000,
+        random_state=42
+    )
+    model.fit(X, y)
+    
+    beta = np.concatenate([[model.intercept_[0]], model.coef_.ravel()])
+    
+    # Compute standard errors from Hessian
+    n = len(y)
+    X_int = np.column_stack([np.ones((n, 1)), X])
+    mu = logistic_mu(X_int, beta)
+    W = mu * (1 - mu)
+    
+    # Information matrix with regularization
+    I_fisher = X_int.T @ (X_int * W[:, None]) / n
+    
+    # Add small ridge for numerical stability
+    I_fisher_reg = I_fisher + (1 / (2 * 1e8)) * np.eye(X_int.shape[1])
+    
+    try:
+        cov = np.linalg.inv(I_fisher_reg)
+        se = np.sqrt(np.diag(cov)) / np.sqrt(n)
+    except:
+        # Fallback: use diagonal approximation
+        se = 1 / np.sqrt(np.diag(I_fisher_reg) * n + 1e-6)
+    
+    return beta, se
+
+# Fit models
+print("\nFitting models...")
+
+# Lasso
+lasso = LogisticRegressionCV(cv=5, penalty='l1', solver='saga', 
+                              max_iter=5000, random_state=42)
+lasso.fit(X, y)
+beta_lasso = np.concatenate([[lasso.intercept_[0]], lasso.coef_.ravel()])
+print(f"  Lasso: {np.sum(np.abs(beta_lasso[1:]) > 1e-6)} non-zero")
+
+# REF-DS
+b_ref, se_ref = ref_ds(X_int, y, beta_lasso)
+print(f"  REF-DS: SE range [{se_ref.min():.2f}, {se_ref.max():.2f}]")
+
+# ORIG-DS
+b_orig, se_orig = orig_ds(X_int, y, beta_lasso)
+print(f"  ORIG-DS: SE range [{se_orig.min():.2f}, {se_orig.max():.2f}]")
+
+# MLE (penalized)
+b_mle, se_mle = mle_penalized(X, y)
+print(f"  MLE: SE range [{se_mle.min():.2f}, {se_mle.max():.2f}]")
+
+# Compute confidence intervals
+z_val = 1.96
+
+ci_low_ref = b_ref - z_val * se_ref
+ci_high_ref = b_ref + z_val * se_ref
+
+ci_low_orig = b_orig - z_val * se_orig
+ci_high_orig = b_orig + z_val * se_orig
+
+ci_low_mle = b_mle - z_val * se_mle
+ci_high_mle = b_mle + z_val * se_mle
+
+# Create results table
+results = pd.DataFrame({
+    'Variable': ['Intercept'] + top_genes,
+    
+    # REF-DS
+    'REF-DS Est': [f'{x:.2f}' for x in b_ref],
+    'REF-DS SE': [f'{x:.2f}' for x in se_ref],
+    'REF-DS 95% CI': [f'({l:.2f}, {u:.2f})' for l, u in zip(ci_low_ref, ci_high_ref)],
+    
+    # ORIG-DS
+    'ORIG-DS Est': [f'{x:.2f}' for x in b_orig],
+    'ORIG-DS SE': [f'{x:.2f}' for x in se_orig],
+    'ORIG-DS 95% CI': [f'({l:.2f}, {u:.2f})' for l, u in zip(ci_low_orig, ci_high_orig)],
+    
+    # MLE
+    'MLE Est': [f'{x:.2f}' for x in b_mle],
+    'MLE SE': [f'{x:.2f}' for x in se_mle],
+    'MLE 95% CI': [f'({l:.2f}, {u:.2f})' for l, u in zip(ci_low_mle, ci_high_mle)],
+})
+
+print("\n" + "="*120)
+print(f"ESTIMATED COEFFICIENTS (n={n}, p={p})")
+print("="*120)
+display(results)
+
+# Show raw SE values to verify they're different
+print("\n" + "="*80)
+print("MLE Standard Errors (verification that they're different):")
+print("="*80)
+for var, se in zip(['Intercept'] + top_genes, se_mle):
+    print(f"  {var:15s}: {se:.4f}")
